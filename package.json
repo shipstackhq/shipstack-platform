@@ -1,0 +1,19 @@
+{
+  "name": "shipstack-monorepo",
+  "version": "0.0.1",
+  "private": true,
+  "packageManager": "pnpm@10.24.0",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "typecheck": "turbo run typecheck",
+    "clean": "turbo run clean && rm -rf node_modules"
+  },
+  "devDependencies": {
+    "prettier": "^3.5.0",
+    "turbo": "^2.4.0",
+    "typescript": "^5.7.3"
+  }
+}
