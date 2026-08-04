@@ -1,0 +1,108 @@
+// Read-only view of the console schema, as seen by Auth.
+//
+// Auth reads these tables through the read-only grant in scripts/db-grants.sql
+// (platform_user has SELECT only). It never writes to them.
+//
+// SECURITY: `secretKey` is intentionally omitted. Auth needs the secret only
+// for backend-proxy Basic auth, and that single lookup is done with a scoped
+// raw query in BackendProxyDetector (see that file's comments). Because the
+// field is absent from this generated client, any other select of it fails to
+// compile.
+//
+// Plans, features, quotas and subscriptions are NOT here. They belong to
+// Billing and Access (decisions D1, D12).
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/console"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Environment {
+  id                       String            @id
+  projectId                String            @map("project_id")
+  slug                     String            @unique
+  publishableKey           String            @unique @map("publishable_key")
+  jwtPublicKey             String            @map("jwt_public_key")
+  jwtPrivateKey            String            @map("jwt_private_key")
+  accessTokenTtl           Int               @map("access_token_ttl")
+  refreshTokenTtl          Int               @map("refresh_token_ttl")
+  requireEmailVerification Boolean           @map("require_email_verification")
+  minPasswordLength        Int               @map("min_password_length")
+  passwordRequirements     String            @map("password_requirements")
+  collectFirstLastName     Boolean           @map("collect_first_last_name")
+  requireFirstLastName     Boolean           @map("require_first_last_name")
+  allowSelfDeletion        Boolean           @map("allow_self_deletion")
+  preventLeakedPasswords   Boolean           @map("prevent_leaked_passwords")
+  minPasswordStrength      Int?              @map("min_password_strength")
+  type                     EnvironmentType
+  status                   EnvironmentStatus
+  allowedOrigins           String[]          @map("allowed_origins")
+  createdAt                DateTime          @map("created_at")
+
+  oauthConfigs      OAuthProviderConfig[]
+  authMethodConfigs AuthMethodConfig[]
+
+  @@map("environments")
+}
+
+model OAuthProviderConfig {
+  id                   String        @id
+  environmentId        String        @map("environment_id")
+  provider             OAuthProvider
+  useCustomCredentials Boolean       @map("use_custom_credentials")
+  providerClientId     String?       @map("provider_client_id")
+  providerClientSecret String?       @map("provider_client_secret")
+
+  environment Environment @relation(fields: [environmentId], references: [id])
+
+  @@unique([environmentId, provider])
+  @@map("oauth_provider_configs")
+}
+
+model AuthMethodConfig {
+  id            String     @id
+  environmentId String     @map("environment_id")
+  method        AuthMethod
+  enabled       Boolean    @default(true)
+
+  environment Environment @relation(fields: [environmentId], references: [id])
+
+  @@unique([environmentId, method])
+  @@map("auth_method_configs")
+}
+
+enum EnvironmentType {
+  DEVELOPMENT
+  PRODUCTION
+}
+
+enum EnvironmentStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+// These values must match the database enums exactly, even where Auth no
+// longer uses them. APPLE and MICROSOFT are still in the database; Microsoft
+// is disabled in Auth (decision D4), so it can never be enabled.
+enum OAuthProvider {
+  GOOGLE
+  GITHUB
+  APPLE
+  MICROSOFT
+}
+
+enum AuthMethod {
+  EMAIL_PASSWORD
+  MAGIC_LINK
+  EMAIL_CODE
+  PASSKEY
+  GOOGLE
+  GITHUB
+  APPLE
+  MICROSOFT
+}

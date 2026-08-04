@@ -1,0 +1,462 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/platform"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Identities ───────────────────────────────────────────────────────────────
+
+model Identity {
+  id            String         @id
+  environmentId String         @map("environment_id")
+  email         String?
+  firstName     String?        @map("first_name")
+  lastName      String?        @map("last_name")
+  avatar        String?
+  credential    String?
+  emailVerified Boolean        @default(false) @map("email_verified")
+  status        IdentityStatus @default(ACTIVE)
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+
+  providers          IdentityProvider[]
+  sessions           Session[]
+  resetTokens        ResetToken[]
+  verificationTokens VerificationToken[]
+  quotaEntities      QuotaEntity[]
+  quotaUsage         QuotaUsage[]
+  credits            Credit[]
+
+  @@unique([environmentId, email])
+  @@index([environmentId])
+  @@map("identities")
+}
+
+// OAuthState/ExchangeCode (the legacy oauth/* routes' own pending-state
+// tables) were dropped in the Phase 9 cutover
+// (docs/unified-attempt-architecture.md) — fully superseded by
+// SignInAttempt/SignUpAttempt below (externalLookupKey/verificationData
+// replace OAuthState.state/codeVerifier; a completed attempt's own
+// COMPLETE status + reload()-by-id replace ExchangeCode's one-time code).
+
+// ─── Unified Sign-In / Sign-Up Attempts ────────────────────────────────────────
+// One resource per auth method (email/password, magic link, email code,
+// passkey, OAuth) instead of a bespoke pending-state table per method —
+// OAuthState/ExchangeCode were two of the four hand-rolled versions of this
+// exact same problem this table set supersedes, and were dropped in the
+// Phase 9 cutover (see above). VerificationToken is NOT superseded — it
+// backs register()'s old 24h email-verification link (verifyEmail/
+// resendVerification), a genuinely different mechanism from EMAIL_CODE, and
+// still has no replacement here. ResetToken is likewise NOT superseded —
+// password reset is account recovery, not a sign-in attempt, a genuinely
+// different concern despite superficial shape overlap. See
+// docs/unified-attempt-architecture.md for the full design and the
+// SignInStrategy interface these rows are read/written through.
+
+model SignInAttempt {
+  id            String   @id
+  environmentId String   @map("environment_id")
+  // Bound once the Client is known — null at creation, since a fresh
+  // browser may not have one yet (mirrors DevBrowser's own clientId
+  // nullable-until-bound pattern).
+  clientId      String?  @map("client_id")
+  status        AttemptStatus @default(NEEDS_IDENTIFIER)
+  identifier    String?
+  identityId    String?  @map("identity_id")
+  // Which method is currently being attempted — null until the caller
+  // picks one (e.g. immediately after create() if strategy was provided
+  // upfront, as OAuth and email/password always do; later, after
+  // supported_first_factors is presented, for an identifier-first flow).
+  strategy      AuthMethod?
+
+  verificationStatus    VerificationStatus? @map("verification_status")
+  verificationExpiresAt DateTime?           @map("verification_expires_at")
+  verificationAttempts  Int                 @default(0) @map("verification_attempts")
+  // Strategy-owned opaque payload (OTP code hash, magic-link token hash,
+  // OAuth code_verifier+state, passkey challenge) — a JSON blob rather than
+  // one column per strategy since strategies keep growing and their fields
+  // are mutually exclusive. Only the matching SignInStrategy implementation
+  // ever interprets this; the generic route handlers never do.
+  verificationData      Json?               @map("verification_data")
+  // Set only for strategies that resolve via an external navigation
+  // (OAuth's consent URL) rather than a direct client-submitted proof.
+  externalRedirectUrl   String?             @map("external_redirect_url")
+  // Indexed, uniquely-lookupable key for resolveExternal() to find this
+  // attempt from an external party's own callback request — OAuth's
+  // `state` param, magic-link's token, etc. Deliberately a real column,
+  // not a path lookup into verificationData: an external callback must
+  // resolve its matching attempt with a single indexed query, same as the
+  // now-deleted OAuthState.state's own @unique index did before this table
+  // existed.
+  // Only ONE such key is ever active per attempt (the current strategy's),
+  // so one column suffices — a strategy switch overwrites it, it doesn't
+  // accumulate.
+  externalLookupKey     String?             @unique @map("external_lookup_key")
+
+  createdSessionId String? @map("created_session_id")
+  // Where THIS attempt's own flow should land (e.g. an OAuth callback
+  // landing route) — distinct from where the user ends up after the whole
+  // thing completes.
+  redirectUrl               String? @map("redirect_url")
+  actionCompleteRedirectUrl String? @map("action_complete_redirect_url")
+
+  // Caller-declared transport for external-navigation strategies (OAuth) —
+  // set at prepare_first_factor time, read back by OAuthCallbackController
+  // to decide whether to 302 redirect or render a postMessage/window.close
+  // popup-closer page. Deliberately NOT part of SignInStrategy/
+  // OAuthStrategyBase: this is a controller/attempt-level transport
+  // concern, not something the strategy (which only resolves an identity)
+  // should know about — mirrors how Clerk's own FAPI OAuth logic has zero
+  // popup awareness; only their Account Portal /popup-callback route and
+  // clerk-js's window.postMessage listener know about popup mode at all.
+  redirectMode      RedirectMode @default(REDIRECT) @map("redirect_mode")
+  // Origin the popup-closer page's postMessage call is scoped to —
+  // required (and only meaningful) when redirectMode is POPUP. Mirrors
+  // the legacy OAuthState.openerOrigin field's exact purpose.
+  popupOpenerOrigin String?      @map("popup_opener_origin")
+
+  // Whole-attempt TTL (Clerk's "abandon_at") — distinct from
+  // verificationExpiresAt, which bounds just the current verification step.
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([environmentId])
+  @@index([clientId])
+  @@map("sign_in_attempts")
+}
+
+model SignUpAttempt {
+  id            String   @id
+  environmentId String   @map("environment_id")
+  clientId      String?  @map("client_id")
+  status        AttemptStatus @default(NEEDS_IDENTIFIER)
+  // Required in practice (sign-up always needs an identifier to create the
+  // Identity against) — kept nullable at the schema level to match
+  // SignInAttempt's shape exactly and avoid divergent column typing between
+  // the two tables; application code enforces the requirement.
+  identifier    String?
+  identityId    String?  @map("identity_id")
+  strategy      AuthMethod?
+  firstName     String?  @map("first_name")
+  lastName      String?  @map("last_name")
+
+  verificationStatus    VerificationStatus? @map("verification_status")
+  verificationExpiresAt DateTime?           @map("verification_expires_at")
+  verificationAttempts  Int                 @default(0) @map("verification_attempts")
+  verificationData      Json?               @map("verification_data")
+  externalRedirectUrl   String?             @map("external_redirect_url")
+  // See SignInAttempt.externalLookupKey's doc comment — same purpose,
+  // added here too for schema symmetry even though Phase 4 doesn't use it
+  // (OAuth sign-up would, once wired to this table).
+  externalLookupKey     String?             @unique @map("external_lookup_key")
+
+  createdSessionId String? @map("created_session_id")
+  redirectUrl               String? @map("redirect_url")
+  actionCompleteRedirectUrl String? @map("action_complete_redirect_url")
+
+  // See SignInAttempt.redirectMode/popupOpenerOrigin's own doc comment —
+  // same purpose, added here too for schema symmetry (sign-up side OAuth
+  // would use this once wired to this table).
+  redirectMode      RedirectMode @default(REDIRECT) @map("redirect_mode")
+  popupOpenerOrigin String?      @map("popup_opener_origin")
+
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([environmentId])
+  @@index([clientId])
+  @@map("sign_up_attempts")
+}
+
+// ─── Identity Providers ───────────────────────────────────────────────────────
+
+model IdentityProvider {
+  id             String        @id
+  identityId     String        @map("identity_id")
+  provider       OAuthProvider
+  providerUserId String        @map("provider_user_id")
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  identity Identity @relation(fields: [identityId], references: [id], onDelete: Cascade)
+
+  @@unique([identityId, provider])
+  @@unique([provider, providerUserId])
+  @@map("identity_providers")
+}
+
+// ─── Clients & Sessions ───────────────────────────────────────────────────────
+// Client = one row per browser/device, created on first contact (pre-auth).
+// Session = one row per signed-in identity on a Client. A Client may have zero
+// or many Sessions (multi-session support is deferred, but the shape is 1:many
+// from day one so it is additive later).
+
+model Client {
+  id                String    @id
+  environmentId     String    @map("environment_id")
+  rotatingTokenHash String    @map("rotating_token_hash")
+  expiresAt         DateTime  @map("expires_at")
+  revokedAt         DateTime? @map("revoked_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  sessions Session[]
+
+  // Scoped to environmentId, not globally unique — nothing should ever resolve
+  // a Client by its rotating token alone; every lookup already carries the
+  // environment context. Keeps the constraint (and its index) partitionable
+  // by environmentId later, with no cross-environment lookup path to retrofit.
+  @@unique([environmentId, rotatingTokenHash])
+  @@index([environmentId])
+  @@map("clients")
+}
+
+// Mirrors Clerk's own dev-browser mechanism (__clerk_db_jwt): in
+// dev/staging, the app and FAPI are on different origins, so a real
+// httpOnly __client cookie set by FAPI can't reliably survive the
+// cross-site round trip. This row is an opaque, unauthenticated pointer —
+// minted before any Client exists (clientId starts null) — that a
+// JS-readable cookie can carry instead, letting FAPI resolve/create the
+// real Client server-side via this mapping without ever needing the
+// httpOnly cookie to leave FAPI's own domain.
+model DevBrowser {
+  id            String    @id
+  environmentId String    @map("environment_id")
+  clientId      String?   @map("client_id")
+  expiresAt     DateTime  @map("expires_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  @@index([environmentId])
+  @@map("dev_browsers")
+}
+
+model Session {
+  id               String        @id
+  clientId         String        @map("client_id")
+  identityId       String        @map("identity_id")
+  status           SessionStatus @default(ACTIVE)
+  refreshTokenHash String        @map("refresh_token_hash")
+  expiresAt        DateTime      @map("expires_at")
+  createdAt        DateTime      @default(now()) @map("created_at")
+  lastActiveAt     DateTime      @default(now()) @map("last_active_at")
+  // Most recently minted access token for this session. Lets GET /auth/client
+  // return every session's usable token as a cheap read (no signing) — only
+  // the session actually being resolved/switched to gets a fresh mint if its
+  // stored token has expired. Matches Clerk's Session.lastActiveToken
+  // (returned as-is from GET /client, refreshed on-demand via a separate
+  // tokens endpoint, not re-signed on every bootstrap call). Nullable: rows
+  // created before this column existed, and briefly on a new Session before
+  // its first token is written.
+  lastAccessToken  String?       @map("last_access_token")
+
+  client   Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  identity Identity @relation(fields: [identityId], references: [id], onDelete: Cascade)
+
+  // Scoped to clientId, not globally unique — every Session lookup already
+  // flows downstream from an already-validated Client (Client is the root of
+  // trust); this constraint reflects that at the schema level instead of just
+  // in application code, and keeps the table partitionable by clientId later.
+  @@unique([clientId, refreshTokenHash])
+  @@index([clientId])
+  @@index([identityId])
+  @@map("sessions")
+}
+
+model ResetToken {
+  id         String    @id
+  identityId String    @map("identity_id")
+  tokenHash  String    @unique @map("token_hash")
+  expiresAt  DateTime  @map("expires_at")
+  usedAt     DateTime? @map("used_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  identity Identity @relation(fields: [identityId], references: [id], onDelete: Cascade)
+
+  @@map("reset_tokens")
+}
+
+model VerificationToken {
+  id         String    @id
+  identityId String    @map("identity_id")
+  tokenHash  String    @unique @map("token_hash")
+  expiresAt  DateTime  @map("expires_at")
+  usedAt     DateTime? @map("used_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  identity Identity @relation(fields: [identityId], references: [id], onDelete: Cascade)
+
+  @@map("verification_tokens")
+}
+
+// ─── Quota Ledger ─────────────────────────────────────────────────────────────
+// Flat usage ledger. One row per resource INSTANCE identified by a dev-generated
+// opaque resourceKey (e.g. "usr_99.rm_456.timers"). quotaKey maps to the
+// console quota tree key (e.g. "timers") for plan limit resolution.
+// projectId is the console project id — shardable key for future scaling.
+
+model QuotaLedger {
+  projectId   String   @map("project_id")
+  resourceKey String   @map("resource_key")
+  quotaKey    String   @map("quota_key")
+  current     Int      @default(0)
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@id([projectId, resourceKey])
+  @@index([projectId, quotaKey])
+  @@map("quota_ledger")
+}
+
+// ─── Quota Entity Tree (deprecated) ──────────────────────────────────────────
+// Replaced by QuotaLedger. Kept to avoid data loss during transition.
+
+model QuotaEntity {
+  id             String    @id @default(uuid())
+  environmentId  String    @map("environment_id")
+  identityId     String    @map("identity_id")
+  parentId       String?   @map("parent_id")
+  resourceKey    String    @map("resource_key")
+  capacityState  Bytes     @default(dbgenerated("'\\x'::bytea")) @map("capacity_state")
+  rateState      Bytes     @default(dbgenerated("'\\x'::bytea")) @map("rate_state")
+  periodStart    DateTime? @map("period_start") @db.Date
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  identity Identity @relation(fields: [identityId], references: [id], onDelete: Cascade)
+
+  @@index([identityId, environmentId])
+  @@index([parentId])
+  @@map("quota_entities")
+}
+
+// ─── Identity Quota State (deprecated) ───────────────────────────────────────
+// Replaced by QuotaLedger. Kept to avoid data loss during transition.
+
+model IdentityQuotaState {
+  identityId    String    @map("identity_id")
+  environmentId String    @map("environment_id")
+  capacityState Bytes     @default(dbgenerated("'\\x'::bytea")) @map("capacity_state")
+  rateState     Bytes     @default(dbgenerated("'\\x'::bytea")) @map("rate_state")
+  periodStart   DateTime? @map("period_start") @db.Date
+
+  @@id([identityId, environmentId])
+  @@map("identity_quota_state")
+}
+
+// ─── Quota Usage (legacy flat model — kept for credits reference) ─────────────
+// quotaId references console.quota — no FK enforced, console owns that table
+
+model QuotaUsage {
+  id          String    @id @default(uuid())
+  identityId  String    @map("identity_id")
+  quotaId     String    @map("quota_id")
+  periodStart DateTime? @map("period_start") @db.Date
+  count       Int       @default(0)
+
+  identity Identity @relation(fields: [identityId], references: [id], onDelete: Cascade)
+
+  @@unique([identityId, quotaId, periodStart])
+  @@map("quota_usage")
+}
+
+// ─── Credits ──────────────────────────────────────────────────────────────────
+// quotaId references console.quota — no FK enforced, console owns that table
+
+model Credit {
+  id         String    @id @default(uuid())
+  identityId String    @map("identity_id")
+  quotaId    String    @map("quota_id")
+  amount     Int
+  remaining  Int
+  expiresAt  DateTime? @map("expires_at")
+  note       String?
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  identity Identity @relation(fields: [identityId], references: [id], onDelete: Cascade)
+
+  @@index([identityId, quotaId, expiresAt])
+  @@map("credits")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum IdentityStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum OAuthProvider {
+  GOOGLE
+  GITHUB
+  APPLE
+  MICROSOFT
+}
+
+enum SessionStatus {
+  ACTIVE
+  REVOKED
+  ENDED
+  EXPIRED
+  REMOVED
+}
+
+enum AttemptStatus {
+  NEEDS_IDENTIFIER
+  NEEDS_FIRST_FACTOR
+  // Reserved for MFA — not implemented yet (out of scope for the current
+  // unified-attempt migration, see docs/unified-attempt-architecture.md).
+  NEEDS_SECOND_FACTOR
+  COMPLETE
+  ABANDONED
+}
+
+enum VerificationStatus {
+  UNVERIFIED
+  VERIFIED
+  EXPIRED
+  FAILED
+}
+
+// See SignInAttempt.redirectMode's own doc comment.
+enum RedirectMode {
+  REDIRECT
+  POPUP
+}
+
+// Local duplicate of console schema's AuthMethod, same pattern as
+// OAuthProvider above — Prisma can't reference an enum across schemas in
+// one generated client, so platform.prisma carries its own copy. Must be
+// kept in lockstep with apps/console-api/prisma/schema.prisma's AuthMethod
+// by hand; nothing enforces this automatically.
+enum AuthMethod {
+  EMAIL_PASSWORD
+  MAGIC_LINK
+  EMAIL_CODE
+  PASSKEY
+  GOOGLE
+  GITHUB
+  APPLE
+  MICROSOFT
+}
+
+// ─── Outbox ───────────────────────────────────────────────────────────────────
+// Transactional outbox (decision D14). Auth writes an event in the same
+// transaction as the change that caused it. A relay publishes unpublished rows
+// and marks them published. Consumers must be idempotent: the relay can publish
+// the same event twice, so every event carries a unique id.
+model OutboxEvent {
+  id            String    @id
+  aggregateType String    @map("aggregate_type")
+  aggregateId   String    @map("aggregate_id")
+  eventType     String    @map("event_type")
+  payload       Json
+  createdAt     DateTime  @default(now()) @map("created_at")
+  publishedAt   DateTime? @map("published_at")
+
+  @@index([publishedAt, createdAt])
+  @@map("outbox_events")
+}
