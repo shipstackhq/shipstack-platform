@@ -2,6 +2,7 @@
   "name": "shipstack-monorepo",
   "version": "0.0.1",
   "private": true,
+  "license": "AGPL-3.0-only",
   "packageManager": "pnpm@10.24.0",
   "scripts": {
     "build": "turbo run build",
