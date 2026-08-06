@@ -1,112 +1,128 @@
-# Shipstack
+<h1 align="center">Shipstack Platform</h1>
 
-Shipstack is multi-tenant SaaS infrastructure: auth, feature access, and billing, as three separate services that share one set of tenant environments.
+Multi-tenant SaaS infrastructure: authentication, feature access, and billing, built as separate services that share tenant environments.
 
-This repository currently contains the **Auth** service, built as a NestJS app with its own database schema, and the design record behind it. Access and Billing are planned, not built.
+This monorepo starts with **Auth**, a complete sign-in and session service. Access and Billing are planned.
 
-## Status
+## Auth
 
-| Part | State |
-| :--- | :--- |
-| **Auth service** (`apps/auth`) | Working. 41 unit tests and 73 end-to-end tests pass. |
-| Email + password sign-up and sign-in | Working, with optional email verification and a leaked-password check. |
-| Email code (one-time password) | Working. Codes are hashed, expire after 10 minutes, and lock after 5 failed attempts. |
-| Google OAuth | Working. PKCE and state checks, with a tenant-domain handoff. |
-| Sessions, token rotation, JWKS | Working. Access tokens are RS256 JWTs verified by public key. |
-| Dev-browser flow | Working in development environments only. Refused in production. |
-| Microsoft OAuth | Removed. Out of scope for v1. |
-| Magic link, passkeys, MFA | Out of scope for v1. The state model reserves room for them. |
-| Access (features, quotas, usage) | Planned. Not in this repo. |
-| Billing (plans, subscriptions) | Planned. Not in this repo. |
-| Event delivery (outbox relay) | Events are written to an outbox table. The relay that publishes them is not built yet. |
-| SDKs (React, Next.js, backend) | Frozen. They will be rebuilt against the documented contract. |
+Shipstack Auth handles sign-up, sign-in, sessions, and token verification for applications with many tenants. Each tenant gets isolated environments, and every auth method goes through the same attempt model.
 
-## How the auth flow works
+- **Sign-in and sign-up as attempts.** Each flow moves through explicit states (`NEEDS_IDENTIFIER`, `NEEDS_FIRST_FACTOR`, `COMPLETE`, and others), modeled on Clerk's approach. A new auth method adds a strategy, not a new set of endpoints.
+- **Methods.** Email and password (with optional verification and a leaked-password check), one-time email codes, and Google OAuth with PKCE and state checks.
+- **Sessions and tokens.** Access tokens are RS256 JWTs, verified against a public JWKS endpoint, so any service can check a session without calling Auth. Sessions rotate their tokens and expire independently of the token.
+- **Environments.** Each project has a development and a production environment, each with its own keys. Public keys use `pk_test_` for development and `pk_live_` for production.
 
-Sign-in and sign-up are **attempts**, following Clerk's model. An attempt moves through explicit states, and every auth method uses the same state machine.
+### Overview
 
-```text
-POST /api/v1/auth/client/sign_ins                  -> NEEDS_FIRST_FACTOR (or COMPLETE, for password)
-POST /api/v1/auth/client/sign_ins/:id/prepare_first_factor   (sends the email code, or returns the OAuth URL)
-POST /api/v1/auth/client/sign_ins/:id/attempt_first_factor   (submits the code)
-GET  /api/v1/auth/client/sign_ins/:id              -> COMPLETE, with an access token
+```mermaid
+flowchart LR
+    App["Your app or SDK"] -->|attempts, sessions| Auth["Auth service"]
+    Browser -->|OAuth redirect| Google["Google"]
+    Google -->|callback| Auth
+    Auth -->|reads and writes| PDB[("Platform DB<br/>identities, sessions, attempts, outbox")]
+    Auth -->|read-only| CDB[("Console DB<br/>environments, auth methods")]
+    Auth -->|public keys| JWKS["/.well-known/jwks.json"]
+    JWKS -.->|verify tokens locally| Services["Any service"]
+    PDB -.->|outbox relay, planned| Billing["Billing"]
+    PDB -.->|outbox relay, planned| Access["Access"]
 ```
 
-Google OAuth goes through the same attempt. The browser is sent to Google, Google calls back to `/api/v1/auth/oauth_callback`, and the callback hands off to the tenant's own domain with a short-lived handshake token. The app redeems that token to set its session cookies.
+### Email-code sign-in
 
-**Client identity.** Each browser has a *client*, which holds a rotating token. Every request resolves the client from exactly one of three places: the `__client` cookie, a signed `x-shipstack-client` header (backend-proxy mode), or a `__shipstack_db_jwt` pointer (development only). The request body is never trusted for identity.
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as Auth
+    participant M as Mail
+    C->>A: POST /sign_ins (identifier, strategy)
+    A-->>C: attempt created
+    C->>A: POST /sign_ins/:id/prepare_first_factor
+    A->>M: send one-time code
+    C->>A: POST /sign_ins/:id/attempt_first_factor (code)
+    A-->>C: verified
+    C->>A: GET /sign_ins/:id
+    A-->>C: COMPLETE, with access token
+```
 
-**Tokens.** Access tokens are RS256 JWTs signed with the environment's private key and published at `/.well-known/jwks.json`. Any service can verify them locally, so checking a session never has to call Auth. Each session also has its own expiry, which is checked independently of the token's `exp`.
+### How a sign-in works
 
-**Environments.** Every request resolves to one environment, from the Host header's project slug. A project has two environments. Development is created with the project. Production is meant to be created by the developer on purpose, once they're ready to go live (D13). That creation path is not built yet. Public keys use `pk_test_` for development and `pk_live_` for production.
+```text
+POST /api/v1/auth/client/sign_ins                            -> NEEDS_FIRST_FACTOR, or COMPLETE for password
+POST /api/v1/auth/client/sign_ins/:id/prepare_first_factor   -> sends the code, or returns the OAuth URL
+POST /api/v1/auth/client/sign_ins/:id/attempt_first_factor   -> submits the code
+GET  /api/v1/auth/client/sign_ins/:id                        -> COMPLETE, with an access token
+```
 
-## Design decisions
+Google sign-in uses the same attempt. The provider redirects to `/api/v1/auth/oauth_callback`, which completes the exchange and hands off to the tenant's own domain with a short-lived handshake token. The app redeems that token to set its session cookies.
 
-The reasoning is recorded in [`docs/`](docs/):
+### Client identity
 
-- [`docs/decisions.md`](docs/decisions.md): the decision log, D1 to D15. Each entry states what was decided and why.
-- [`docs/auth-contract.md`](docs/auth-contract.md): the auth contract. Routes, attempt states, client identity, tokens, and what leaves Auth.
-- [`docs/port-inventory.md`](docs/port-inventory.md): how the Auth code was split out of the earlier monolith, module by module.
+Each browser has a **client** with a rotating token. The server resolves it from one of three sources, never from the request body:
 
-The main choices:
+- the `__client` cookie (direct mode),
+- a signed `x-shipstack-client` header (backend-proxy mode), or
+- a `__shipstack_db_jwt` pointer (development only).
 
-- **Each product owns its own tables.** Auth never writes to plans, quotas, or subscriptions. Billing and Access own those (D1).
-- **Plans are looked up by identity, not stored in the token.** A product reads the identity's plan from a cache kept current by events. Auth has no plan concepts at all (D12).
-- **Usage is never cached.** Quota counters are requested from Access on each use (D10).
-- **Bitfield permissions are planned for RBAC**, not for plans. The per-tenant permission registry is still to be designed (D11).
+### Architecture
 
-## Bugs found while porting
+```text
+apps/auth/
+  src/modules/auth/     attempts, sessions, OAuth, password and verification flows
+  src/core/             identity tokens, encryption, mail, database, outbox
+  src/common/           guards, client resolution, error envelopes
+  prisma/platform.prisma    Auth-owned tables
+  prisma/console.prisma     read model of tenant configuration (read-only)
+  e2e/                  end-to-end suite
+```
 
-Porting the code and running its tests against a real database turned up three problems:
+Auth owns its tables and reads tenant configuration through a read-only connection. It doesn't write to plans, quotas, or subscriptions, which belong to Billing and Access. State changes publish events through a transactional outbox, so an event exists if and only if the change committed.
 
-1. **The rotated client cookie was never sent to the browser after an OAuth sign-in.** The handshake rotated the client token on the server, but the cookies it returned left out `__client`. The browser then presented the old token on its next request, which triggered replay detection. Fixed in `createHandshakeForAttempt`.
-2. **Local development hosts were rejected.** The `.stack.shipstack.development` suffix was in the docs and in the tests, but not in the code. The suffix list now lives in one module, `src/common/hosted-domains.ts`, which both the host parser and the key decoder read.
-3. **Two copies of the domain list could drift apart.** They're now one.
-
-## Running it locally
+## Running locally
 
 Requirements: Node 20+, pnpm, and Docker.
 
 ```bash
 pnpm install
 cd apps/auth
-cp .env.example .env                # fill in the values
-pnpm prisma:generate                # generate the Prisma clients
-pnpm start:dev                      # http://localhost:9001, Swagger at /api/v1/docs
+cp .env.example .env          # fill in ENCRYPTION_KEY and CLIENT_COOKIE_SECRET
+pnpm prisma:generate
+pnpm start:dev                # http://localhost:9001, Swagger at /api/v1/docs
 ```
 
-`.env` needs `PLATFORM_DATABASE_URL`, `CONSOLE_DATABASE_URL` (read-only), `ENCRYPTION_KEY` (64 hex characters), and `CLIENT_COOKIE_SECRET`. Email is sent through SMTP when `SMTP_HOST` is set. Without it, emails are written to the log.
+Without `SMTP_HOST`, emails are written to the log.
 
 ## Testing
 
 ```bash
 cd apps/auth
-pnpm test              # 41 unit tests
-pnpm test:db           # start a throwaway Postgres on :5433 and load the schemas
-cp e2e/.env.test.example e2e/.env.test   # then fill in the values
-pnpm test:e2e          # 73 end-to-end tests against a real database
+pnpm test                     # unit tests
+pnpm test:db                  # start a throwaway Postgres on :5433 and load the schemas
+cp e2e/.env.test.example e2e/.env.test
+pnpm test:e2e                 # end-to-end tests against a real database
 ```
 
-The end-to-end tests run the real NestJS app over HTTP against a real Postgres. They cover sign-up, sign-in, email codes, OAuth (with the provider mocked by `nock`), sessions, token expiry, the dev-browser gate, backend-proxy auth, and error shapes.
+The end-to-end suite runs the app over HTTP against Postgres. It covers sign-up and sign-in, email codes, Google OAuth (with the provider mocked), sessions and token expiry, backend-proxy authentication, and error responses.
 
-Because Auth reads environment data that Console owns, the e2e harness loads a copy of Console's schema (`apps/auth/e2e/support/console-fixture.prisma`) to stand in for it. The Auth app itself never imports that copy.
+## Status and limits
 
-## Known limits
+| Area | Status |
+| :--- | :--- |
+| Auth: email and password, email code, Google OAuth | Available |
+| Sessions, token rotation, JWKS | Available |
+| Development-only dev-browser flow | Available |
+| Magic link, passkeys, MFA | Planned |
+| Event delivery from the outbox | Planned |
+| Access (features, quotas, usage) | Planned |
+| Billing (plans, subscriptions) | Planned |
+| Framework SDKs | Planned |
 
-- **The outbox relay is not running.** `identity.created` and other events are written in the same transaction as the change, but nothing publishes them yet.
-- **Auth reads Console's tables directly** through a read-only grant. The planned replacement is a published view, so Console can change its tables without breaking Auth.
-- **Password reset and email verification** are implemented, but the email path is only tested against a fake mail service.
-- **No rate limiting.** It's deliberately out of v1, and it matters before any production use.
-- **Google is the only OAuth provider.** Adding another means a new strategy class and a case in the default-credentials lookup. The attempt flow itself doesn't change.
+Rate limiting is not included yet. Add it before running Auth in production.
 
-## Repository layout
+## Documentation
 
-```text
-apps/auth/            Auth service (NestJS, Prisma, Postgres)
-  prisma/             platform.prisma (Auth-owned tables), console.prisma (read model)
-  src/                modules/auth (attempts, sessions, OAuth), core/, common/
-  e2e/                end-to-end suite and harness
-docs/                 decision log, auth contract, port inventory
-```
+- [`docs/auth-contract.md`](docs/auth-contract.md): routes, attempt states, client identity, and token contract.
 
-Everything else in the earlier monorepo (quotas, subscriptions, the Next.js SDKs, the Go self-hosted build, the console) stays in the source repository. It's intentionally not in this one.
+## License
+
+To be added.
